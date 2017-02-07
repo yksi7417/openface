@@ -31,6 +31,9 @@ import argparse
 import cv2
 import imagehash
 import json
+import pickle
+import pandas as pd
+from operator import itemgetter
 from PIL import Image
 import numpy as np
 import os
@@ -38,10 +41,17 @@ import StringIO
 import urllib
 import base64
 
-from sklearn.decomposition import PCA
-from sklearn.grid_search import GridSearchCV
-from sklearn.manifold import TSNE
+from sklearn.pipeline import Pipeline
+from sklearn.lda import LDA
+from sklearn.preprocessing import LabelEncoder
 from sklearn.svm import SVC
+from sklearn.grid_search import GridSearchCV
+from sklearn.mixture import GMM
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.naive_bayes import GaussianNB
+
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 
 import matplotlib as mpl
 mpl.use('Agg')
@@ -96,6 +106,9 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
         self.svm = None
         if args.unknown:
             self.unknownImgs = np.load("./examples/web/unknown.npy")
+        with open("/root/openface/demos/web/pavd-classifier.pkl", 'r') as f:
+            (self.le, self.clf) = pickle.load(f)
+
 
     def onConnect(self, request):
         print("Client connecting: {0}".format(request.peer))
@@ -242,6 +255,15 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
             ]
             self.svm = GridSearchCV(SVC(C=1), param_grid, cv=5).fit(X, y)
 
+    def infer(self, rep):
+        rep = rep.reshape(1, -1)
+        predictions = self.clf.predict_proba(rep).ravel()
+        maxI = np.argmax(predictions)
+        person = self.le.inverse_transform(maxI)
+        confidence = predictions[maxI]
+        person = "{} ({:.0f}%)".format(person, confidence * 100)
+        return (person, confidence)
+
     def processFrame(self, dataURL, identity):
         head = "data:image/jpeg;base64,"
         assert(dataURL.startswith(head))
@@ -265,7 +287,7 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
         #     return
 
         identities = []
-        # bbs = align.getAllFaceBoundingBoxes(rgbFrame)
+        #bbs = align.getAllFaceBoundingBoxes(rgbFrame)
         bb = align.getLargestFaceBoundingBox(rgbFrame)
         bbs = [bb] if bb is not None else []
         for bb in bbs:
@@ -282,7 +304,7 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
                 identity = self.images[phash].identity
             else:
                 rep = net.forward(alignedFace)
-                # print(rep)
+                #print(rep)
                 if self.training:
                     self.images[phash] = Face(rep, identity)
                     # TODO: Transferring as a string is suboptimal.
@@ -298,10 +320,10 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
                     }
                     self.sendMessage(json.dumps(msg))
                 else:
-                    if len(self.people) == 0:
+                    if self.clf:
+                        (name, confidence) = self.infer(rep)
+                        print("Predict {} with {:.2f} confidence.".format(name, confidence))
                         identity = -1
-                    elif len(self.people) == 1:
-                        identity = 0
                     elif self.svm:
                         identity = self.svm.predict(rep)[0]
                     else:
@@ -319,9 +341,7 @@ class OpenFaceServerProtocol(WebSocketServerProtocol):
                     cv2.circle(annotatedFrame, center=landmarks[p], radius=3,
                                color=(102, 204, 255), thickness=-1)
                 if identity == -1:
-                    if len(self.people) == 1:
-                        name = self.people[0]
-                    else:
+                    if confidence < 0.70:
                         name = "Unknown"
                 else:
                     name = self.people[identity]
